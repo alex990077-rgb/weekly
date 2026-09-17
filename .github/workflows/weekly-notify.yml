@@ -1,0 +1,138 @@
+name: Weekly Notify
+
+# 科技爱好者周刊（阮一峰，ruanyf/weekly）新刊 -> Server酱 推送微信
+#
+# 【为什么这样触发】
+# 周刊「每周五发布」，但具体几点不定（常在北京时间周五 08:00-10:00，偶尔更晚），
+# 且 GitHub 的 schedule 在高峰期会排队延迟，所以周五排 3 次、周六早上排 2 次兜底。
+# 真正的去重靠 latest.json 里记的期号 + 文件 sha：
+#   - 期号没变        -> 直接跳过，不会重复推送
+#   - 期号变大        -> 推新刊
+#   - 同号但 sha 变了 -> 推一条「第 N 期已更新」（阮老师发完常改错别字/补链接）
+#
+# cron 用 UTC。北京时间 = UTC+8，已换算好：
+#   周五 10:00 / 15:00 / 20:00 (北京)  = 02:00 / 07:00 / 12:00 UTC
+#   周六 09:00 / 13:00 (北京)          = 01:00 / 05:00 UTC
+#
+# 【上游 vs 本仓库】
+# 内容默认取**上游 ruanyf/weekly**，所以本仓库不需要和上游保持同步也能正常收推送。
+# 需要改成只看本仓库，把下面的 WEEKLY_UPSTREAM 改成 alex990077-rgb/weekly 即可。
+
+on:
+  schedule:
+    - cron: "0 2 * * 5"    # 周五 10:00 北京时间
+    - cron: "0 7 * * 5"    # 周五 15:00 北京时间
+    - cron: "0 12 * * 5"   # 周五 20:00 北京时间
+    - cron: "0 1 * * 6"    # 周六 09:00 北京时间（兜底）
+    - cron: "0 5 * * 6"    # 周六 13:00 北京时间（兜底）
+  workflow_dispatch:        # 支持网页手动 Run workflow（测试/补跑）
+    inputs:
+      force:
+        description: "忽略状态，强制重推当前最新一期"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write            # 需要把 latest.json / archive 写回仓库
+
+concurrency:
+  group: weekly-notify
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  WEEKLY_UPSTREAM: ruanyf/weekly
+  WEEKLY_PUSH_MODE: digest   # digest = 摘要（推荐）；full = 推全文 markdown
+  WEEKLY_TITLE_STYLE: short  # short = 卡片标题只写「第 N 期」；full = 带副标题
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+
+      - name: 安装 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: 检查推送密钥是否已配置
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: |
+          if [ -z "$SERVERCHAN_SENDKEY" ]; then
+            echo "::error title=缺少推送密钥::没有读到仓库 Secret SERVERCHAN_SENDKEY。解决：仓库 Settings → Secrets and variables → Actions → New repository secret，Name 必须正好是 SERVERCHAN_SENDKEY，Value 填你的 Server酱 SendKey（sct... 开头），保存后重新运行。"
+            exit 1
+          fi
+          echo "Server酱 SendKey 已读到（长度 ${#SERVERCHAN_SENDKEY}）"
+
+      - name: 今天该不该跑（周五/周六 + 今天还没推过）
+        id: gate
+        run: |
+          set -euo pipefail
+          TODAY=$(date +%F)
+          DOW=$(date +%u)          # 1=周一 … 5=周五 6=周六 7=周日
+          echo "北京时间：$TODAY 星期$DOW"
+
+          # 只在周五、周六跑（周六是周五的兜底）
+          if [ "$DOW" != "5" ] && [ "$DOW" != "6" ]; then
+            echo "今天不是周五/周六，跳过。（schedule 排的就是这两天，出现这种情况通常是 GitHub 延迟到隔天才投递）"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 今天已经推过就不再跑（防止周五多次触发重复推送）
+          if [ -f latest.json ] && grep -q "\"$TODAY" latest.json; then
+            echo "今天（$TODAY）已经推送过，本次跳过："
+            cat latest.json
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: 探测新刊（预览，不推送）
+        if: steps.gate.outputs.run == 'true'
+        run: python weekly_notify.py --dry-run
+
+      - name: 推送并把存档写回仓库
+        if: steps.gate.outputs.run == 'true'
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ "${{ inputs.force }}" = "true" ]; then EXTRA="--force"; fi
+          python weekly_notify.py $EXTRA
+
+      - name: 保存状态与存档（提交回仓库）
+        if: always() && steps.gate.outputs.run == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add latest.json archive 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "无状态变化，跳过提交（说明本期之前已经推过）"
+          else
+            NUM=$(python -c "import json;print(json.load(open('latest.json'))['last_number'])" 2>/dev/null || echo "?")
+            git commit -m "chore: weekly notify $(date +%F)（第 $NUM 期）"
+            if ! git push; then
+              echo "::warning title=状态未写回仓库::git push 失败。请检查 Settings → Actions → General → Workflow permissions 是否为 Read and write permissions。本次推送已发出，只是去重记录没保存，下次可能重复推送。"
+            fi
+          fi
+
+      - name: 上传运行日志（排查用）
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: weekly-notify-log-${{ github.run_number }}
+          path: |
+            latest.json
+            archive
+          if-no-files-found: ignore
